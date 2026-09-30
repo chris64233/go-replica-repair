@@ -152,6 +152,75 @@ func chunkIndex(m Manifest, id string) int {
 	return -1
 }
 
+func TestSessionCannotMixChunksAcrossManifestVersions(t *testing.T) {
+	ctx := context.Background()
+	svc, clk := newTestService(t)
+	data := payloads()
+	v1 := testManifest("src", "v1", data, clk.Now())
+	// v2 keeps c2/c3 but replaces c1 with different bytes (and digest).
+	v2data := [][]byte{[]byte("replaced-chunk-one"), data[1], data[2]}
+	v2 := testManifest("src", "v2", v2data, clk.Now())
+	if err := svc.RegisterManifest(ctx, v1); err != nil {
+		t.Fatal(err)
+	}
+	sessID, err := svc.CreateRepair(ctx, "src", "v1", "tgt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Source publishes v2 after the session froze v1.
+	if err := svc.RegisterManifest(ctx, v2); err != nil {
+		t.Fatal(err)
+	}
+
+	// A worker that (incorrectly) fetched c1 from the new v2 manifest uploads
+	// those bytes; the receipt must be rejected because the session works
+	// against the frozen v1 snapshot only.
+	v2key, err := svc.UploadBlob(ctx, sessID, v2data[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := claimUntil(t, svc, sessID, "w1", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.SubmitReceipt(ctx, Receipt{
+		SessionID: sessID, ChunkID: "c1", LeaseID: l.ID,
+		Epoch: l.Epoch, BlobKey: v2key, Digest: v2.Chunks[0].Digest,
+	})
+	if !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("v2 chunk in v1 session: want ErrDigestMismatch, got %v", err)
+	}
+
+	// The rejected receipt did not consume the lease: the same worker can
+	// still complete c1 with the correct v1 bytes under the same lease.
+	key, err := svc.UploadBlob(ctx, sessID, data[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitReceipt(ctx, Receipt{
+		SessionID: sessID, ChunkID: "c1", LeaseID: l.ID,
+		Epoch: l.Epoch, BlobKey: key, Digest: v1.Chunks[0].Digest,
+	}); err != nil {
+		t.Fatalf("v1 receipt after mismatch: %v", err)
+	}
+
+	// The session completes against v1 content only, and the target switches
+	// to v1 — never to a v1/v2 mix.
+	for _, c := range v1.Chunks[1:] {
+		repairChunk(t, svc, sessID, "w", c, data[chunkIndex(v1, c.ID)])
+	}
+	note, err := svc.GetResult(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note == nil || note.ManifestVer != "v1" || note.ChunkCount != len(v1.Chunks) {
+		t.Fatalf("completion = %+v, want frozen v1", note)
+	}
+	if cur, _ := svc.GetReplicaCurrentManifest(ctx, "tgt"); cur != "src@v1" {
+		t.Fatalf("target = %q, want src@v1", cur)
+	}
+}
+
 func TestCannotCreateSessionForUnknownManifest(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newTestService(t)
@@ -564,6 +633,51 @@ func TestTimeoutStopsLeases(t *testing.T) {
 	p, _ := svc.GetProgress(ctx, sessID)
 	if p.State != SessionTimedOut || p.FinishedAt == nil {
 		t.Fatalf("progress = %+v", p)
+	}
+}
+
+func TestTimeoutOrphansBecomeCleanable(t *testing.T) {
+	ctx := context.Background()
+	svc, clk := newTestService(t, WithSessionTTL(30*time.Second))
+	data := payloads()
+	m := testManifest("src", "v1", data, clk.Now())
+	svc.RegisterManifest(ctx, m)
+	sessID, _ := svc.CreateRepair(ctx, "src", "v1", "tgt")
+	key, err := svc.UploadBlob(ctx, sessID, data[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clk.advance(31 * time.Second)
+	if err := svc.AdvanceTimeouts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := svc.GetProgress(ctx, sessID)
+	if p.State != SessionTimedOut {
+		t.Fatalf("state = %s, want timed_out", p.State)
+	}
+
+	// The uploaded chunk was never referenced by a successful manifest, so it
+	// is cleanable; cleanup removes exactly that blob.
+	keys, err := svc.ListCleanable(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0] != key {
+		t.Fatalf("cleanable = %v, want [%s]", keys, key)
+	}
+	n, err := svc.CleanupSession(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("cleanup removed %d, want 1", n)
+	}
+	if _, exists := svc.k.blobs[key]; exists {
+		t.Fatal("orphan blob still present after cleanup")
+	}
+	if _, err := svc.CleanupSession(ctx, sessID); !errors.Is(err, ErrNothingToClean) {
+		t.Fatalf("second cleanup: want ErrNothingToClean, got %v", err)
 	}
 }
 
