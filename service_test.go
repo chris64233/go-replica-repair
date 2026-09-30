@@ -152,6 +152,111 @@ func chunkIndex(m Manifest, id string) int {
 	return -1
 }
 
+// A manifest published mid-repair must not leak into a running session:
+// claims only hand out frozen chunks, and receipts carrying the new
+// version's chunk ids or digests are rejected.
+func TestNewManifestDoesNotMixIntoRunningSession(t *testing.T) {
+	ctx := context.Background()
+	svc, clk := newTestService(t)
+	v1data := payloads()
+	v1 := testManifest("src", "v1", v1data, clk.Now())
+	v2data := [][]byte{[]byte("brand-new-one"), []byte("chunk-two"), []byte("chunk-three"), []byte("extra-c4")}
+	v2 := testManifest("src", "v2", v2data, clk.Now())
+	if err := svc.RegisterManifest(ctx, v1); err != nil {
+		t.Fatal(err)
+	}
+	sessID, err := svc.CreateRepair(ctx, "src", "v1", "tgt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Source publishes v2 while the v1 session is running.
+	if err := svc.RegisterManifest(ctx, v2); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := claimUntil(t, svc, sessID, "w", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// v2's c1 payload must not verify against the frozen v1 digest.
+	v2key, err := svc.UploadBlob(ctx, sessID, v2data[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitReceipt(ctx, Receipt{
+		SessionID: sessID, ChunkID: "c1", LeaseID: lease.ID,
+		Epoch: lease.Epoch, BlobKey: v2key, Digest: v2key,
+	}); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("v2 payload on frozen session: want ErrDigestMismatch, got %v", err)
+	}
+	// v2-only chunk ids are unknown to the frozen session.
+	if _, err := svc.SubmitReceipt(ctx, Receipt{
+		SessionID: sessID, ChunkID: "c4", LeaseID: lease.ID,
+		Epoch: lease.Epoch, BlobKey: v2key, Digest: v2key,
+	}); !errors.Is(err, ErrChunkNotFound) {
+		t.Fatalf("v2-only chunk on frozen session: want ErrChunkNotFound, got %v", err)
+	}
+	// The failed attempts did not consume the lease: c1 still verifies with
+	// the correct v1 payload on the same lease/epoch.
+	if _, err := svc.UploadBlob(ctx, sessID, v1data[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitReceipt(ctx, Receipt{
+		SessionID: sessID, ChunkID: "c1", LeaseID: lease.ID,
+		Epoch: lease.Epoch, BlobKey: v1.Chunks[0].Digest, Digest: v1.Chunks[0].Digest,
+	}); err != nil {
+		t.Fatalf("frozen c1 receipt after rejected mixing attempts: %v", err)
+	}
+	for _, c := range v1.Chunks[1:] {
+		repairChunk(t, svc, sessID, "w", c, v1data[chunkIndex(v1, c.ID)])
+	}
+	note, err := svc.GetResult(ctx, sessID)
+	if err != nil || note == nil || note.ManifestVer != "v1" || note.ChunkCount != 3 {
+		t.Fatalf("completion = %v %+v, want frozen v1 with 3 chunks", err, note)
+	}
+	if cur, _ := svc.GetReplicaCurrentManifest(ctx, "tgt"); cur != "src@v1" {
+		t.Fatalf("target switched to %q, want src@v1", cur)
+	}
+}
+
+// After a session terminates, a fresh session for the same target may use a
+// newer manifest version — the freeze is per-session, not per-target.
+func TestNewSessionAfterCancelUsesNewManifest(t *testing.T) {
+	ctx := context.Background()
+	svc, clk := newTestService(t)
+	v1data := payloads()
+	v1 := testManifest("src", "v1", v1data, clk.Now())
+	v2data := [][]byte{[]byte("brand-new-one"), []byte("chunk-two"), []byte("chunk-three"), []byte("extra-c4")}
+	v2 := testManifest("src", "v2", v2data, clk.Now())
+	svc.RegisterManifest(ctx, v1)
+	oldID, err := svc.CreateRepair(ctx, "src", "v1", "tgt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.RegisterManifest(ctx, v2)
+	// A second running session for the same target is rejected.
+	if _, err := svc.CreateRepair(ctx, "src", "v2", "tgt"); !errors.Is(err, ErrSessionExists) {
+		t.Fatalf("concurrent session for target: want ErrSessionExists, got %v", err)
+	}
+	if err := svc.Cancel(ctx, oldID); err != nil {
+		t.Fatal(err)
+	}
+	newID, err := svc.CreateRepair(ctx, "src", "v2", "tgt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range v2.Chunks {
+		repairChunk(t, svc, newID, "w", c, v2data[chunkIndex(v2, c.ID)])
+	}
+	note, err := svc.GetResult(ctx, newID)
+	if err != nil || note == nil || note.ManifestVer != "v2" || note.ChunkCount != 4 {
+		t.Fatalf("completion = %v %+v, want v2 with 4 chunks", err, note)
+	}
+	if cur, _ := svc.GetReplicaCurrentManifest(ctx, "tgt"); cur != "src@v2" {
+		t.Fatalf("target switched to %q, want src@v2", cur)
+	}
+}
+
 func TestCannotCreateSessionForUnknownManifest(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newTestService(t)
@@ -567,6 +672,59 @@ func TestTimeoutStopsLeases(t *testing.T) {
 	}
 }
 
+// A timed-out session stops handing out leases and its uploaded blobs become
+// cleanable; cleanup actually removes them from the store.
+func TestTimeoutOrphansBecomeCleanable(t *testing.T) {
+	ctx := context.Background()
+	svc, clk := newTestService(t, WithSessionTTL(30*time.Second))
+	m := testManifest("src", "v1", payloads(), clk.Now())
+	svc.RegisterManifest(ctx, m)
+	sessID, _ := svc.CreateRepair(ctx, "src", "v1", "tgt")
+	key1, err := svc.UploadBlob(ctx, sessID, data0())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key2, err := svc.UploadBlob(ctx, sessID, []byte("never-verified-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clk.advance(31 * time.Second)
+	if err := svc.AdvanceTimeouts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ClaimChunk(ctx, sessID, "w"); !errors.Is(err, ErrSessionNotRunning) {
+		t.Fatalf("claim after timeout: want ErrSessionNotRunning, got %v", err)
+	}
+	if _, err := svc.UploadBlob(ctx, sessID, []byte("late")); !errors.Is(err, ErrSessionNotRunning) {
+		t.Fatalf("upload after timeout: want ErrSessionNotRunning, got %v", err)
+	}
+
+	keys, err := svc.ListCleanable(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("cleanable = %v, want 2 keys", keys)
+	}
+	n, err := svc.CleanupSession(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("cleanup removed %d blobs, want 2", n)
+	}
+	for _, key := range []string{key1, key2} {
+		if _, exists := svc.k.blobs[key]; exists {
+			t.Fatalf("blob %s still present after cleanup", key)
+		}
+	}
+	// Cleanup is one-shot: a second pass reports nothing left.
+	if _, err := svc.CleanupSession(ctx, sessID); !errors.Is(err, ErrNothingToClean) {
+		t.Fatalf("second cleanup: want ErrNothingToClean, got %v", err)
+	}
+}
+
 func TestCleanupDoesNotDeleteReferencedBlobs(t *testing.T) {
 	ctx := context.Background()
 	svc, clk := newTestService(t)
@@ -701,5 +859,60 @@ func TestProgressTracksSize(t *testing.T) {
 	p, _ := svc.GetProgress(ctx, sessID)
 	if p.VerifiedSize != m.Chunks[0].Size || p.Pending != 2 {
 		t.Fatalf("progress = %+v", p)
+	}
+}
+
+// The unique completion notification and the switched replica pointer survive
+// a process restart unchanged; no second notification appears.
+func TestCompletionSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	clk := &fakeClock{t: time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)}
+	svc, err := New(WithClock(clk), WithPersistence(FilePersistence{Path: path}),
+		WithSessionTTL(time.Minute), WithLeaseTTL(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := payloads()
+	m := testManifest("src", "v1", data, clk.Now())
+	svc.RegisterManifest(ctx, m)
+	sessID, _ := svc.CreateRepair(ctx, "src", "v1", "tgt")
+	for _, c := range m.Chunks {
+		repairChunk(t, svc, sessID, "w", c, data[chunkIndex(m, c.ID)])
+	}
+	note1, err := svc.GetResult(ctx, sessID)
+	if err != nil || note1 == nil {
+		t.Fatalf("completion = %v %+v", err, note1)
+	}
+
+	// Restart well past every deadline: the terminal state must not regress.
+	clk.advance(time.Hour)
+	svc2, err := New(WithClock(clk), WithPersistence(FilePersistence{Path: path}),
+		WithSessionTTL(time.Minute), WithLeaseTTL(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	note2, err := svc2.GetResult(ctx, sessID)
+	if err != nil || note2 == nil {
+		t.Fatalf("completion after restart = %v %+v", err, note2)
+	}
+	if *note1 != *note2 {
+		t.Fatalf("notification changed across restart: %+v vs %+v", note1, note2)
+	}
+	p, err := svc2.GetProgress(ctx, sessID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.State != SessionSucceeded || p.Verified != 3 || p.NotificationID != sessID {
+		t.Fatalf("progress after restart = %+v", p)
+	}
+	if cur, _ := svc2.GetReplicaCurrentManifest(ctx, "tgt"); cur != "src@v1" {
+		t.Fatalf("target manifest after restart = %q", cur)
+	}
+	// The succeeded session's uploads are all pinned by the replica manifest.
+	if _, err := svc2.CleanupSession(ctx, sessID); !errors.Is(err, ErrNothingToClean) {
+		t.Fatalf("cleanup of succeeded session: want ErrNothingToClean, got %v", err)
 	}
 }
