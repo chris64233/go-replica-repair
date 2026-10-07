@@ -115,6 +115,19 @@ var (
 	// ErrReasonRequired is returned when an acceptance is revoked without a
 	// reason.
 	ErrReasonRequired = errors.New("revocation reason required")
+	// ErrSessionConflict is returned when a caller-chosen session number is
+	// reused with a different target, candidate set, candidate manifest
+	// version or chunk digest. The original session is never modified.
+	ErrSessionConflict = errors.New("session conflicts with existing session")
+	// ErrSessionBlocked is returned when a session recorded digest
+	// divergences between candidates and therefore must not execute.
+	ErrSessionBlocked = errors.New("session blocked by chunk digest divergence")
+	// ErrSourceMismatch is returned when a receipt names a source other than
+	// the one the session assigned to the chunk.
+	ErrSourceMismatch = errors.New("receipt source mismatch")
+	// ErrCandidateInvalid is returned for a malformed multi-source candidate
+	// set (empty source, duplicate source, missing version or bad chunk).
+	ErrCandidateInvalid = errors.New("source candidate invalid")
 )
 
 // Acceptance states.
@@ -170,6 +183,12 @@ type Lease struct {
 	WorkerID  string    `json:"worker_id"`
 	Epoch     int       `json:"epoch"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// SourceID is the frozen source replica assigned to this chunk. Empty
+	// for single-source sessions.
+	SourceID string `json:"source_id,omitempty"`
+	// SessionVersion is the session version the worker must echo back in
+	// its receipt. Zero for single-source sessions.
+	SessionVersion int `json:"session_version,omitempty"`
 }
 
 // Receipt is a worker's completion report for a leased chunk.
@@ -184,6 +203,12 @@ type Receipt struct {
 	// Digest is the digest the worker observed. It is checked against the
 	// frozen manifest and the stored blob.
 	Digest string `json:"digest"`
+	// SourceID must equal the source the session assigned to the chunk
+	// (multi-source sessions only).
+	SourceID string `json:"source_id,omitempty"`
+	// SessionVersion must equal the version handed out with the lease
+	// (multi-source sessions only).
+	SessionVersion int `json:"session_version,omitempty"`
 }
 
 // ReceiptResult tells the caller how a receipt was handled.
@@ -230,6 +255,9 @@ type chunkState struct {
 	Epoch     int        `json:"epoch"`
 	LeaseID   string     `json:"lease_id,omitempty"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// SourceID is the frozen source replica chosen for this chunk by the
+	// stable assignment rule (multi-source sessions only).
+	SourceID string `json:"source_id,omitempty"`
 	// FinalLease keeps the lease/epoch that produced the verified blob, so
 	// late receipts from stale workers can be diagnosed.
 	FinalLease string     `json:"final_lease_id,omitempty"`
@@ -259,6 +287,20 @@ type session struct {
 	Cleaned             bool                    `json:"cleaned"`
 	Notification        *CompletionNotification `json:"notification,omitempty"`
 	NotificationEmitted bool                    `json:"notification_emitted"`
+	// Multi is true for sessions created via CreateMultiSourceRepair.
+	Multi bool `json:"multi,omitempty"`
+	// Version is the session version handed out with every lease; receipts
+	// must echo it. Only meaningful for multi-source sessions.
+	Version int `json:"version,omitempty"`
+	// Sources is the frozen candidate set: source id, manifest version and
+	// declared chunk digests, deep-copied at creation.
+	Sources []SourceCandidate `json:"sources,omitempty"`
+	// Blocked is true when candidates disagreed on a chunk digest; a
+	// blocked session never hands out leases or accepts uploads/receipts.
+	Blocked bool `json:"blocked,omitempty"`
+	// Divergences records every chunk whose candidates declared
+	// conflicting digests.
+	Divergences []ChunkDivergence `json:"divergences,omitempty"`
 }
 
 // replica tracks a target replica and the manifest version it currently serves.

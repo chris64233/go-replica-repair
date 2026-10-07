@@ -144,6 +144,9 @@ func (s *Service) UploadBlob(ctx context.Context, sessionID string, data []byte)
 	if sess.State != SessionRunning {
 		return "", ErrSessionNotRunning
 	}
+	if sess.Blocked {
+		return "", ErrSessionBlocked
+	}
 	key := digestBytes(data)
 	if _, exists := k.blobs[key]; !exists {
 		stored := make([]byte, len(data))
@@ -175,6 +178,9 @@ func (s *Service) ClaimChunk(ctx context.Context, sessionID, workerID string) (*
 	if sess.State != SessionRunning {
 		return nil, ErrSessionNotRunning
 	}
+	if sess.Blocked {
+		return nil, ErrSessionBlocked
+	}
 	now := k.clock.Now()
 	idx := -1
 	for i := range sess.Chunks {
@@ -199,6 +205,12 @@ func (s *Service) ClaimChunk(ctx context.Context, sessionID, workerID string) (*
 		WorkerID:  workerID,
 		Epoch:     c.Epoch,
 		ExpiresAt: exp,
+	}
+	if sess.Multi {
+		// The worker learns which frozen source to pull this chunk from and
+		// which session version its receipt must echo back.
+		lease.SourceID = c.SourceID
+		lease.SessionVersion = sess.Version
 	}
 	if err := k.persist(); err != nil {
 		return nil, err
@@ -236,6 +248,9 @@ func (s *Service) SubmitReceipt(ctx context.Context, r Receipt) (*ReceiptResult,
 	if sess.State != SessionRunning {
 		return nil, ErrSessionNotRunning
 	}
+	if sess.Blocked {
+		return nil, ErrSessionBlocked
+	}
 	c := findChunk(sess, r.ChunkID)
 	if c == nil {
 		return nil, ErrChunkNotFound
@@ -255,6 +270,17 @@ func (s *Service) SubmitReceipt(ctx context.Context, r Receipt) (*ReceiptResult,
 	// Stale-worker defense: the whole tuple must match the current grant.
 	if c.State != ChunkLeased || c.LeaseID != r.LeaseID || c.Epoch != r.Epoch {
 		return nil, ErrLeaseMismatch
+	}
+	if sess.Multi {
+		// The receipt must match the full triple handed out with the lease:
+		// session version, assigned source and lease. A receipt from a
+		// superseded lease or a wrong source never overwrites anything.
+		if r.SessionVersion != sess.Version {
+			return nil, ErrLeaseMismatch
+		}
+		if r.SourceID != c.SourceID {
+			return nil, ErrSourceMismatch
+		}
 	}
 	now := k.clock.Now()
 	if c.ExpiresAt == nil || !c.ExpiresAt.After(now) {

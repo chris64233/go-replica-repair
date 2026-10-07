@@ -10,6 +10,7 @@
 4. **取消/超时收敛**：会话取消或超过截止时间后停止发放新租约、拒绝新上传；已上传但未被成功清单引用的数据块进入可清理状态。清理按引用计数保护——任何有效副本当前清单引用的摘要、以及其他会话上传集仍持有的内容都不会被误删（blob 以内容摘要为键，天然去重共享）。
 5. **修复验收单**：修复成功只代表目标副本指向了修复版本，**不代表可以立即作为新源副本**。验收单在创建时冻结四要素——修复版本、抽检块集合、校验规则、验收人；抽检结果允许分批提交，同一块的第二次结论必须与第一次一致，否则只标记冲突而不覆盖首次结果；全部抽检通过且版本未被再次修复取代时，才在同一临界区内把副本提升为可用源副本。部分失败保留失败块及原因并冻结为 `failed`，禁止切换为新源；验收期间若再次修复已经开始或目标已切到新版本，旧验收冻结为 `stale`，不能把正在修复的版本标成可用。撤销验收必须填写理由，撤销已通过的验收会撤回提升。
 6. **状态持久化**：每次成功变更后整体快照落盘（JSON，写临时文件 + `rename` 原子替换），进程重启后精确恢复租约、进度、完成通知、副本指针与验收单（含已冻结结论）。
+7. **多来源修复**：单个源副本数据不全时，一次会话可冻结多个候选源副本（各自声明拥有的数据块与摘要、清单版本）。系统按稳定规则为每个块选定摘要一致的来源；候选对同一块摘要分歧时记录分歧并阻断会话，绝不任意选择。工作者领取块时同时获得会话版本、来源与租约，回执必须三者匹配。
 
 ## 包结构
 
@@ -19,6 +20,7 @@
 | `kernel.go` | 串行化状态内核、时钟抽象、快照持久化接口与文件实现 |
 | `service.go` | 对外服务：登记、创建、上传、领取、回执、取消、超时推进、结果/进度查询、清理 |
 | `acceptance.go` | 修复验收单：创建/冻结范围、分批抽检结果与冲突检测、版本竞争防护、提升/撤销/查询 |
+| `multisource.go` | 多来源修复：候选冻结、稳定来源选择、分歧阻断、会话幂等/冲突、修复计划查询 |
 
 ## API 流程
 
@@ -99,6 +101,42 @@ keys, _ := svc.ListCleanable(ctx, sessID)
 n, err := svc.CleanupSession(ctx, sessID)
 ```
 
+### 多来源修复
+
+当任何一个源副本都无法单独提供全部数据块时，用 `CreateMultiSourceRepair` 一次冻结多个候选源：
+
+```go
+plan, err := svc.CreateMultiSourceRepair(ctx, goreplicarepair.MultiRepairRequest{
+    SessionID: "ms-20261007-01", // 调用方选定的会话号
+    TargetID:  "replica-target-3",
+    ObjectID:  "obj-1",
+    Candidates: []goreplicarepair.SourceCandidate{
+        {SourceID: "src-a", ManifestVersion: "v17", Chunks: []goreplicarepair.SourceChunk{
+            {ID: "c1", Size: 2048, Digest: "ab12…"},
+            {ID: "c2", Size: 2048, Digest: "cd34…"},
+        }},
+        {SourceID: "src-b", ManifestVersion: "v17", Chunks: []goreplicarepair.SourceChunk{
+            {ID: "c2", Size: 2048, Digest: "cd34…"},
+            {ID: "c3", Size: 2048, Digest: "ef56…"},
+        }},
+    },
+})
+```
+
+行为约定：
+
+1. **冻结**：候选集合（来源、清单版本、每块摘要）在创建时深拷贝冻结；调用方之后修改入参、源端后续发布新版本，都不影响本会话的选择依据。
+2. **稳定选择**：每个块由声明它的候选中摘要（与大小）完全一致者提供，并列时取来源 ID 字典序最小者——规则确定、可复现。若候选对同一块给出不同摘要，该块记入 `Divergences`，会话进入阻断状态：`ClaimChunk`/`UploadBlob`/`SubmitReceipt` 一律返回 `ErrSessionBlocked`，绝不任意选一份继续。
+3. **回执三元组**：`ClaimChunk` 返回的租约携带 `SourceID` 与 `SessionVersion`；回执必须同时匹配会话版本、选定来源和租约（ID+epoch）。来源不符返回 `ErrSourceMismatch`，会话版本不符按 `ErrLeaseMismatch` 处理；租约接管后旧工作者的迟到回执不能覆盖新结果，已校验成功的块也不会被重复写入。
+4. **幂等与冲突**：相同会话号 + 相同候选集合重复创建返回原会话；候选清单版本、目标或任一摘要变化返回 `ErrSessionConflict`，原会话不受影响。全部块校验通过后才原子发布目标副本并发出唯一完成通知。
+5. **查询**：`GetRepairPlan` 展示每个块的选定来源、摘要、租约与校验结果（`FinalLease`/`VerifiedAt`）、冻结的候选清单以及阻断分歧。
+
+```go
+plan, _ := svc.GetRepairPlan(ctx, "ms-20261007-01")
+// plan.Chunks[i]：ChunkID / SourceID / Digest / State / FinalLease / VerifiedAt
+// plan.Divergences：阻断执行的摘要分歧及各方声明
+```
+
 ### 错误语义
 
 | 错误 | 含义 |
@@ -117,6 +155,10 @@ n, err := svc.CleanupSession(ctx, sessID)
 | `ErrAcceptanceStale` | 验收绑定的修复版本已被新修复切换取代，旧验收冻结且不能提升 |
 | `ErrAcceptanceRace` | 全部抽检通过时同一目标存在运行中的再次修复会话，旧验收输掉版本竞争 |
 | `ErrReasonRequired` | 撤销验收未填写理由 |
+| `ErrSessionConflict` | 多来源会话号被复用但候选版本、目标或摘要发生变化（原会话不变） |
+| `ErrSessionBlocked` | 候选对同一块摘要分歧，会话被阻断，拒绝领取/上传/回执 |
+| `ErrSourceMismatch` | 回执来源与会话为该块选定的来源不一致 |
+| `ErrCandidateInvalid` | 多来源候选非法（空来源/重复来源/缺版本/块声明非法/目标或会话号为空） |
 
 ## 设计要点
 
@@ -156,3 +198,9 @@ go test -race ./...
 - 验收号重复请求幂等返回原单，抽检集合/规则变化返回冲突；撤销必填理由并撤回已完成提升；
 - 版本竞争：新版本修复切换后旧验收冻结 `stale`；验收完成时存在再次修复会话返回 `ErrAcceptanceRace` 不提升；并发提交最后一批只提升一次；
 - 验收单跨重启恢复（未决批次、冻结结论与提升状态）。
+- 多来源：候选集合创建时冻结（调用方后续篡改入参不影响会话）；并列候选按字典序稳定选源；
+- 相同会话号+相同候选幂等返回原会话，版本/摘要/目标变化返回 `ErrSessionConflict`；
+- 摘要分歧记录双方声明并阻断会话，领取/上传/回执均拒绝且不发布；
+- 回执必须匹配会话版本+来源+租约三元组；租约接管后迟到回执被拒，已校验块不可重写；
+- 全部块校验通过后原子发布目标副本，`GetRepairPlan` 展示逐块来源/摘要/租约结果与分歧；
+- 多来源会话跨重启恢复（冻结候选、逐块分配、会话版本与幂等语义）。
