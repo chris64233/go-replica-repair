@@ -315,6 +315,10 @@ func (s *Service) completeLocked(sess *session, now time.Time) error {
 	// manifest version.
 	rep.CurrentManifest = manifestKey(sess.SourceID, m.Version)
 	rep.UpdatedAt = now
+	// A new repair version has just taken over the target: any acceptance
+	// still open against an older repair version is frozen stale inside this
+	// same critical section, so it cannot later promote the version it lost.
+	s.invalidateAcceptancesLocked(sess.TargetID, rep.CurrentManifest, now)
 
 	note := CompletionNotification{
 		SessionID:   sess.ID,

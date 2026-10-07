@@ -34,6 +34,7 @@ type kernel struct {
 	// digest on every receipt instead of trusting the worker.
 	blobs         map[string][]byte
 	notifications map[string]CompletionNotification
+	acceptances   map[string]*acceptance
 }
 
 func newKernel(clock Clock, store Persistence) *kernel {
@@ -48,6 +49,7 @@ func newKernel(clock Clock, store Persistence) *kernel {
 		replicas:      map[string]*replica{},
 		blobs:         map[string][]byte{},
 		notifications: map[string]CompletionNotification{},
+		acceptances:   map[string]*acceptance{},
 	}
 	return k
 }
@@ -88,6 +90,9 @@ func (k *kernel) load() error {
 	if snap.Notifications != nil {
 		k.notifications = snap.Notifications
 	}
+	if snap.Acceptances != nil {
+		k.acceptances = snap.Acceptances
+	}
 	return nil
 }
 
@@ -104,6 +109,7 @@ func (k *kernel) persist() error {
 		Replicas:      k.replicas,
 		Blobs:         k.blobs,
 		Notifications: k.notifications,
+		Acceptances:   k.acceptances,
 	}
 	data, err := json.MarshalIndent(&snap, "", "  ")
 	if err != nil {

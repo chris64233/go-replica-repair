@@ -90,6 +90,57 @@ var (
 	// ErrNothingToClean is returned when cleanup is requested but the session
 	// has no orphaned blobs.
 	ErrNothingToClean = errors.New("nothing to clean")
+	// ErrAcceptanceNotFound is returned when an acceptance certificate does
+	// not exist.
+	ErrAcceptanceNotFound = errors.New("acceptance not found")
+	// ErrAcceptanceInvalid is returned when an acceptance request or result
+	// is malformed (missing id/rule/acceptor, unknown or empty sample set).
+	ErrAcceptanceInvalid = errors.New("acceptance invalid")
+	// ErrAcceptanceConflict is returned when an acceptance number is reused
+	// with a different sample set/rule, or when a chunk's second inspection
+	// result disagrees with its first one. The first result is preserved.
+	ErrAcceptanceConflict = errors.New("acceptance conflict")
+	// ErrAcceptanceClosed is returned when results are submitted to an
+	// acceptance whose decision is already frozen (passed/failed/stale) or
+	// that has been revoked.
+	ErrAcceptanceClosed = errors.New("acceptance already decided or revoked")
+	// ErrAcceptanceStale is returned when the repair version bound to the
+	// acceptance no longer matches the replica's current version: the
+	// certificate cannot continue and cannot promote anything.
+	ErrAcceptanceStale = errors.New("acceptance bound to a superseded repair version")
+	// ErrAcceptanceRace is returned when all samples pass but another repair
+	// session for the same target is already running (re-repair in flight):
+	// the old acceptance must not mark the contested version usable.
+	ErrAcceptanceRace = errors.New("acceptance lost version race against re-repair")
+	// ErrReasonRequired is returned when an acceptance is revoked without a
+	// reason.
+	ErrReasonRequired = errors.New("revocation reason required")
+)
+
+// Acceptance states.
+const (
+	// AcceptancePending is still collecting per-chunk sample results.
+	AcceptancePending = "pending"
+	// AcceptancePassed means every sampled chunk passed and the replica was
+	// promoted to a usable source replica for the bound version.
+	AcceptancePassed = "passed"
+	// AcceptanceFailed means at least one sampled chunk failed or produced
+	// conflicting results; the failed chunks are retained on the certificate
+	// and the replica must not be promoted.
+	AcceptanceFailed = "failed"
+	// AcceptanceStale means the bound repair version was superseded before
+	// the decision was frozen.
+	AcceptanceStale = "stale"
+	// AcceptanceRevoked was explicitly revoked; the revocation reason is
+	// retained.
+	AcceptanceRevoked = "revoked"
+)
+
+// Validation rules understood by the acceptance flow.
+const (
+	// RuleDigestSHA256 re-hashes the repaired blob and compares it against the
+	// chunk digest frozen in the repair manifest.
+	RuleDigestSHA256 = "digest-sha256"
 )
 
 // Chunk describes one piece of an object. Digest is the content digest
@@ -216,6 +267,13 @@ type replica struct {
 	ObjectID        string    `json:"object_id"`
 	CurrentManifest string    `json:"current_manifest"`
 	UpdatedAt       time.Time `json:"updated_at"`
+	// AcceptedManifest is the repair version that passed a frozen
+	// acceptance certificate. Only this version may serve as a usable source
+	// replica; CurrentManifest alone (repaired but not yet accepted) is not
+	// enough. Empty until the first acceptance passes.
+	AcceptedManifest string `json:"accepted_manifest,omitempty"`
+	// AcceptedAt records when the last successful promotion happened.
+	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
 }
 
 // snapshot is the persisted on-disk format. Bumping snapshotFormat requires a
@@ -230,4 +288,98 @@ type snapshot struct {
 	Replicas      map[string]*replica               `json:"replicas"`
 	Blobs         map[string][]byte                 `json:"blobs"`
 	Notifications map[string]CompletionNotification `json:"notifications"`
+	Acceptances   map[string]*acceptance            `json:"acceptances"`
+}
+
+// AcceptanceRequest opens (or re-requests) a repair acceptance certificate.
+// Every field is frozen at creation: a later repair version, a changed sample
+// set or a changed validation rule can never flow into an existing
+// certificate.
+type AcceptanceRequest struct {
+	// ID is the caller-chosen acceptance number. Reusing the same number with
+	// the same frozen parameters returns the original certificate; reusing it
+	// with different samples/rule returns ErrAcceptanceConflict.
+	ID string
+	// SessionID identifies the completed repair whose version is accepted.
+	SessionID string
+	// SampleChunks is the frozen set of chunk ids subject to inspection.
+	SampleChunks []string
+	// Rule is the frozen validation rule (e.g. RuleDigestSHA256).
+	Rule string
+	// Acceptor is the person/system responsible for the decision.
+	Acceptor string
+}
+
+// ChunkResult is one inspector's verdict for one sampled chunk. Results may
+// arrive in batches over time.
+type ChunkResult struct {
+	ChunkID string `json:"chunk_id"`
+	Pass    bool   `json:"pass"`
+	// Reason is required when Pass is false.
+	Reason string `json:"reason,omitempty"`
+}
+
+// ChunkResultView is one sample's recorded outcome, including a conflict flag
+// raised when a second submission disagreed with the first.
+type ChunkResultView struct {
+	ChunkID   string     `json:"chunk_id"`
+	Pass      bool       `json:"pass"`
+	Reason    string     `json:"reason,omitempty"`
+	Conflict  bool       `json:"conflict"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// AcceptanceView is the query projection of an acceptance certificate.
+type AcceptanceView struct {
+	ID            string            `json:"id"`
+	State         string            `json:"state"`
+	SessionID     string            `json:"session_id"`
+	TargetID      string            `json:"target_id"`
+	SourceID      string            `json:"source_id"`
+	RepairVersion string            `json:"repair_version"`
+	SampleChunks  []string          `json:"sample_chunks"`
+	Rule          string            `json:"rule"`
+	Acceptor      string            `json:"acceptor"`
+	Results       []ChunkResultView `json:"results"`
+	// Failures lists chunk ids that failed or produced conflicting results.
+	Failures     []string   `json:"failures,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	DecidedAt    *time.Time `json:"decided_at,omitempty"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason string     `json:"revoke_reason,omitempty"`
+	// Promoted is true only when the certificate actually marked the replica
+	// usable as a new source replica.
+	Promoted bool `json:"promoted"`
+}
+
+// acceptance is the persisted certificate state.
+type acceptance struct {
+	ID            string `json:"id"`
+	State         string `json:"state"`
+	SessionID     string `json:"session_id"`
+	TargetID      string `json:"target_id"`
+	SourceID      string `json:"source_id"`
+	RepairVersion string `json:"repair_version"`
+	// ManifestKey is manifestKey(source, version) the replica must currently
+	// serve for the certificate to remain valid.
+	ManifestKey  string     `json:"manifest_key"`
+	SampleChunks []string   `json:"sample_chunks"`
+	Rule         string     `json:"rule"`
+	Acceptor     string     `json:"acceptor"`
+	CreatedAt    time.Time  `json:"created_at"`
+	DecidedAt    *time.Time `json:"decided_at,omitempty"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason string     `json:"revoke_reason,omitempty"`
+	Promoted     bool       `json:"promoted"`
+	// Results keeps the first recorded verdict per chunk. A disagreeing
+	// second submission flips Conflict instead of overwriting.
+	Results map[string]*acceptanceChunk `json:"results"`
+}
+
+type acceptanceChunk struct {
+	ChunkID   string     `json:"chunk_id"`
+	Pass      bool       `json:"pass"`
+	Reason    string     `json:"reason,omitempty"`
+	Conflict  bool       `json:"conflict"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
