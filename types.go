@@ -33,6 +33,9 @@ import (
 const (
 	// SessionRunning accepts new leases and receipts.
 	SessionRunning = "running"
+	// SessionBlocked was created with unresolved source divergences and can
+	// never hand out leases until it is cancelled.
+	SessionBlocked = "blocked"
 	// SessionSucceeded reached the target manifest and the unique completion
 	// notification was produced.
 	SessionSucceeded = "succeeded"
@@ -115,6 +118,19 @@ var (
 	// ErrReasonRequired is returned when an acceptance is revoked without a
 	// reason.
 	ErrReasonRequired = errors.New("revocation reason required")
+	// ErrSessionConflict is returned when a caller-chosen session number is
+	// reused with a different candidate set, candidate version, target
+	// manifest or chunk digest.
+	ErrSessionConflict = errors.New("session conflict")
+	// ErrSessionBlocked is returned when an operation requires an executable
+	// session but it was blocked by unresolved source divergences.
+	ErrSessionBlocked = errors.New("session blocked by source divergence")
+	// ErrSourceMismatch is returned when a receipt names a source or session
+	// version different from the one granted by the lease.
+	ErrSourceMismatch = errors.New("source or session version mismatch")
+	// ErrCandidateInvalid is returned when a candidate source declaration is
+	// malformed (missing id/version, unknown chunk or empty digest).
+	ErrCandidateInvalid = errors.New("candidate invalid")
 )
 
 // Acceptance states.
@@ -170,6 +186,13 @@ type Lease struct {
 	WorkerID  string    `json:"worker_id"`
 	Epoch     int       `json:"epoch"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// SourceID is the source replica the worker must fetch this chunk from.
+	// It is empty for legacy single-source sessions.
+	SourceID string `json:"source_id,omitempty"`
+	// SessionVersion identifies the frozen basis of the session. Receipts
+	// must echo it back so a stale worker cannot report against a session
+	// whose selection basis changed.
+	SessionVersion int `json:"session_version,omitempty"`
 }
 
 // Receipt is a worker's completion report for a leased chunk.
@@ -178,6 +201,11 @@ type Receipt struct {
 	ChunkID   string `json:"chunk_id"`
 	LeaseID   string `json:"lease_id"`
 	Epoch     int    `json:"epoch"`
+	// SourceID and SessionVersion must match the values granted by the
+	// lease; a mismatch means the worker fetched from the wrong source or
+	// reports against a superseded session basis.
+	SourceID       string `json:"source_id,omitempty"`
+	SessionVersion int    `json:"session_version,omitempty"`
 	// BlobKey identifies the uploaded content; it must equal the chunk digest
 	// recorded in the frozen manifest.
 	BlobKey string `json:"blob_key"`
@@ -230,6 +258,11 @@ type chunkState struct {
 	Epoch     int        `json:"epoch"`
 	LeaseID   string     `json:"lease_id,omitempty"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// SourceID is the candidate source selected for this chunk at session
+	// creation. It never changes for the lifetime of the session.
+	SourceID string `json:"source_id,omitempty"`
+	// Digest is the digest agreed by every candidate that owns this chunk.
+	Digest string `json:"digest,omitempty"`
 	// FinalLease keeps the lease/epoch that produced the verified blob, so
 	// late receipts from stale workers can be diagnosed.
 	FinalLease string     `json:"final_lease_id,omitempty"`
@@ -245,6 +278,21 @@ type session struct {
 	TargetID string `json:"target_id"`
 	ObjectID string `json:"object_id"`
 	State    string `json:"state"`
+	// SessionNo is the caller-chosen idempotency number. Reusing it with
+	// the same frozen basis returns this session; reusing it with a
+	// different basis returns ErrSessionConflict.
+	SessionNo string `json:"session_no,omitempty"`
+	// Version is the session's execution version, frozen at creation and
+	// echoed by every lease and receipt.
+	Version int `json:"version,omitempty"`
+	// Multi marks a session created through CreateMultiSourceRepair.
+	Multi bool `json:"multi,omitempty"`
+	// Candidates is the frozen set of candidate source replicas with their
+	// manifest versions and declared chunk digests.
+	Candidates []SourceCandidate `json:"candidates,omitempty"`
+	// Divergences records every chunk whose candidates disagreed (or were
+	// absent). A non-empty list blocks the session.
+	Divergences []Divergence `json:"divergences,omitempty"`
 	// Frozen is the immutable snapshot of the source manifest. Even if the
 	// source publishes a new manifest during repair, this copy never changes.
 	Frozen     Manifest     `json:"frozen_manifest"`
@@ -382,4 +430,86 @@ type acceptanceChunk struct {
 	Reason    string     `json:"reason,omitempty"`
 	Conflict  bool       `json:"conflict"`
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// ---- Multi-source repair ----
+
+// Divergence kinds recorded on a blocked session.
+const (
+	// DivergenceNoSource means no candidate declared the chunk.
+	DivergenceNoSource = "no_source"
+	// DivergenceDigestConflict means candidates (or the target manifest)
+	// declared different digests for the same chunk.
+	DivergenceDigestConflict = "digest_conflict"
+)
+
+// ChunkDeclaration is a candidate's claim that it owns one chunk with a
+// specific content digest.
+type ChunkDeclaration struct {
+	ChunkID string `json:"chunk_id"`
+	Digest  string `json:"digest"`
+}
+
+// SourceCandidate declares one healthy source replica: its identity, the
+// manifest version it currently serves and the chunks (with digests) it can
+// provide. The declaration is frozen into the session at creation time, so a
+// later manifest update on the source never changes the session's selection
+// basis.
+type SourceCandidate struct {
+	SourceID string             `json:"source_id"`
+	Version  string             `json:"version"`
+	Chunks   []ChunkDeclaration `json:"chunks"`
+}
+
+// MultiSourceRequest opens a multi-source repair session. ID is the
+// caller-chosen session number used for idempotent creation.
+type MultiSourceRequest struct {
+	ID string `json:"id"`
+	// TargetID is the replica being repaired.
+	TargetID string `json:"target_id"`
+	// Manifest is the target manifest the replica must reach; it is frozen
+	// into the session.
+	Manifest Manifest `json:"manifest"`
+	// Candidates are the healthy source replicas to draw chunks from.
+	Candidates []SourceCandidate `json:"candidates"`
+}
+
+// Divergence records one chunk that could not be assigned a source because
+// the frozen candidate declarations disagree (or are missing).
+type Divergence struct {
+	ChunkID string `json:"chunk_id"`
+	Kind    string `json:"kind"`
+	// Digests maps "source@version" to the digest it declared for the chunk.
+	Digests map[string]string `json:"digests,omitempty"`
+}
+
+// ChunkView is the query projection of one chunk's repair state: which source
+// was selected, with which digest, and what the lease machinery produced.
+type ChunkView struct {
+	ChunkID    string     `json:"chunk_id"`
+	SourceID   string     `json:"source_id"`
+	Digest     string     `json:"digest"`
+	State      string     `json:"state"`
+	Epoch      int        `json:"epoch"`
+	LeaseID    string     `json:"lease_id,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	FinalLease string     `json:"final_lease_id,omitempty"`
+	FinalEpoch int        `json:"final_epoch,omitempty"`
+	VerifiedAt *time.Time `json:"verified_at,omitempty"`
+}
+
+// MultiSourceView is the query projection of a multi-source repair session.
+type MultiSourceView struct {
+	SessionID   string            `json:"session_id"`
+	SessionNo   string            `json:"session_no"`
+	State       string            `json:"state"`
+	Version     int               `json:"version"`
+	TargetID    string            `json:"target_id"`
+	ManifestVer string            `json:"manifest_version"`
+	Candidates  []SourceCandidate `json:"candidates"`
+	Chunks      []ChunkView       `json:"chunks"`
+	Divergences []Divergence      `json:"divergences,omitempty"`
+	Deadline    time.Time         `json:"deadline"`
+	CreatedAt   time.Time         `json:"created_at"`
+	FinishedAt  *time.Time        `json:"finished_at,omitempty"`
 }

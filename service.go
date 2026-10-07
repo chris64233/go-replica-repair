@@ -141,6 +141,9 @@ func (s *Service) UploadBlob(ctx context.Context, sessionID string, data []byte)
 		return "", ErrSessionNotFound
 	}
 	s.sweepLocked(sess)
+	if sess.State == SessionBlocked {
+		return "", ErrSessionBlocked
+	}
 	if sess.State != SessionRunning {
 		return "", ErrSessionNotRunning
 	}
@@ -172,6 +175,9 @@ func (s *Service) ClaimChunk(ctx context.Context, sessionID, workerID string) (*
 		return nil, ErrSessionNotFound
 	}
 	s.sweepLocked(sess)
+	if sess.State == SessionBlocked {
+		return nil, ErrSessionBlocked
+	}
 	if sess.State != SessionRunning {
 		return nil, ErrSessionNotRunning
 	}
@@ -199,6 +205,12 @@ func (s *Service) ClaimChunk(ctx context.Context, sessionID, workerID string) (*
 		WorkerID:  workerID,
 		Epoch:     c.Epoch,
 		ExpiresAt: exp,
+	}
+	if sess.Multi {
+		// Bind the grant to the frozen selection: the worker must fetch
+		// from this exact source and echo the session version back.
+		lease.SourceID = c.SourceID
+		lease.SessionVersion = sess.Version
 	}
 	if err := k.persist(); err != nil {
 		return nil, err
@@ -233,12 +245,21 @@ func (s *Service) SubmitReceipt(ctx context.Context, r Receipt) (*ReceiptResult,
 		return nil, ErrSessionNotFound
 	}
 	s.sweepLocked(sess)
+	if sess.State == SessionBlocked {
+		return nil, ErrSessionBlocked
+	}
 	if sess.State != SessionRunning {
 		return nil, ErrSessionNotRunning
 	}
 	c := findChunk(sess, r.ChunkID)
 	if c == nil {
 		return nil, ErrChunkNotFound
+	}
+	if sess.Multi && (r.SourceID != c.SourceID || r.SessionVersion != sess.Version) {
+		// The receipt must match the source and session version granted by
+		// the lease: a worker reporting from the wrong source or against a
+		// superseded basis can never mark the chunk verified.
+		return nil, ErrSourceMismatch
 	}
 	expected := findManifestChunk(sess.Frozen, r.ChunkID)
 	if expected == nil {
@@ -352,6 +373,13 @@ func (s *Service) Cancel(ctx context.Context, sessionID string) error {
 		return ErrSessionNotFound
 	}
 	s.sweepLocked(sess)
+	if sess.State == SessionBlocked {
+		// A blocked session can only converge by being cancelled.
+		now := k.clock.Now()
+		sess.State = SessionCancelled
+		sess.FinishedAt = &now
+		return k.persist()
+	}
 	if sess.State != SessionRunning {
 		return ErrSessionNotRunning
 	}
