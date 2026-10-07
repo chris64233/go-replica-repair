@@ -90,7 +90,145 @@ var (
 	// ErrNothingToClean is returned when cleanup is requested but the session
 	// has no orphaned blobs.
 	ErrNothingToClean = errors.New("nothing to clean")
+	// ErrAcceptanceNotFound is returned when an acceptance order id is unknown.
+	ErrAcceptanceNotFound = errors.New("acceptance not found")
+	// ErrAcceptanceConflict is returned when an acceptance id is reused with a
+	// different sample set, rule, inspector or version than first recorded.
+	ErrAcceptanceConflict = errors.New("acceptance request conflicts with recorded order")
+	// ErrAcceptanceClosed is returned when submitting samples to an order
+	// whose decision is already final (approved/rejected/revoked/stale).
+	ErrAcceptanceClosed = errors.New("acceptance order already decided")
+	// ErrAcceptanceStale is returned when the accepted version is no longer
+	// the replica's current version, or a new repair is running for the
+	// target: the old acceptance may not continue nor mark anything usable.
+	ErrAcceptanceStale = errors.New("acceptance version superseded")
+	// ErrSampleConflict is returned when a second result for the same chunk
+	// disagrees with the first recorded one. The chunk is marked conflicted;
+	// the first result is never overwritten.
+	ErrSampleConflict = errors.New("sample result conflicts with recorded result")
+	// ErrChunkNotSampled is returned when a sample names a chunk that is not
+	// part of the order's frozen sample set.
+	ErrChunkNotSampled = errors.New("chunk not in acceptance sample set")
+	// ErrReasonRequired is returned when revoking an acceptance without a
+	// reason.
+	ErrReasonRequired = errors.New("reason required")
+	// ErrAcceptanceInvalid is returned for an empty/inconsistent acceptance
+	// request (no chunks, unknown chunk ids, unsupported rule, ...).
+	ErrAcceptanceInvalid = errors.New("acceptance request invalid")
 )
+
+// Acceptance decisions.
+const (
+	// AcceptancePending is still collecting sample results.
+	AcceptancePending = "pending"
+	// AcceptanceApproved means every sampled chunk passed and the replica was
+	// marked usable for the accepted version.
+	AcceptanceApproved = "approved"
+	// AcceptanceRejected means at least one sampled chunk failed or
+	// conflicted; the failed chunks are kept and the replica must not be
+	// used as a new source.
+	AcceptanceRejected = "rejected"
+	// AcceptanceStale means the accepted version was superseded (re-repair or
+	// switch) before the order concluded; it can never mark anything usable.
+	AcceptanceStale = "stale"
+	// AcceptanceRevoked was withdrawn by the inspector with a reason.
+	AcceptanceRevoked = "revoked"
+)
+
+// Sample states within an acceptance order.
+const (
+	// SamplePending has no result yet.
+	SamplePending = "pending"
+	// SamplePassed matched the manifest digest under the acceptance rule.
+	SamplePassed = "passed"
+	// SampleFailed mismatched; the failure reason is retained.
+	SampleFailed = "failed"
+	// SampleConflict received a second, disagreeing result; the first result
+	// stands and the chunk can never count as passed.
+	SampleConflict = "conflict"
+)
+
+// DigestAlgorithmSHA256 is the verification rule supported by this service.
+const DigestAlgorithmSHA256 = "sha256"
+
+// AcceptanceRule freezes how sampled chunks are verified. It is part of the
+// order's identity: reusing an acceptance id with a different rule conflicts.
+type AcceptanceRule struct {
+	Algorithm string `json:"algorithm"`
+}
+
+// AcceptanceRequest creates an acceptance order. The order pins the replica
+// version, the exact sample set, the verification rule and the inspector.
+// ID may be supplied by the caller for idempotent retries; when empty one is
+// generated.
+type AcceptanceRequest struct {
+	ID        string         `json:"id,omitempty"`
+	TargetID  string         `json:"target_id"`
+	SourceID  string         `json:"source_id"`
+	Version   string         `json:"version"`
+	ChunkIDs  []string       `json:"chunk_ids"`
+	Rule      AcceptanceRule `json:"rule"`
+	Inspector string         `json:"inspector"`
+}
+
+// SampleReport is one inspector observation for a sampled chunk. Digest is
+// the content digest the inspector recomputed; the service compares it with
+// the frozen manifest digest under the order's rule. Reason explains a
+// failure and is retained for the query view.
+type SampleReport struct {
+	ChunkID string `json:"chunk_id"`
+	Digest  string `json:"digest"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// SampleView is the query-time state of one sampled chunk.
+type SampleView struct {
+	ChunkID        string `json:"chunk_id"`
+	State          string `json:"state"`
+	ExpectedDigest string `json:"expected_digest"`
+	ObservedDigest string `json:"observed_digest,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+}
+
+// AcceptanceView is the query-time view of an acceptance order: repair
+// version, sampled chunks, failure reasons and the acceptance decision.
+type AcceptanceView struct {
+	ID           string         `json:"id"`
+	TargetID     string         `json:"target_id"`
+	SourceID     string         `json:"source_id"`
+	ManifestVer  string         `json:"manifest_version"`
+	Rule         AcceptanceRule `json:"rule"`
+	Inspector    string         `json:"inspector"`
+	Samples      []SampleView   `json:"samples"`
+	Decision     string         `json:"decision"`
+	RevokeReason string         `json:"revoke_reason,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	DecidedAt    *time.Time     `json:"decided_at,omitempty"`
+}
+
+// sampleState is the persisted per-chunk acceptance record.
+type sampleState struct {
+	ChunkID        string `json:"chunk_id"`
+	State          string `json:"state"`
+	ExpectedDigest string `json:"expected_digest"`
+	ObservedDigest string `json:"observed_digest,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+}
+
+// acceptance is the persisted state of one acceptance order.
+type acceptance struct {
+	ID           string         `json:"id"`
+	TargetID     string         `json:"target_id"`
+	SourceID     string         `json:"source_id"`
+	ManifestVer  string         `json:"manifest_version"`
+	Rule         AcceptanceRule `json:"rule"`
+	Inspector    string         `json:"inspector"`
+	Samples      []sampleState  `json:"samples"`
+	Decision     string         `json:"decision"`
+	RevokeReason string         `json:"revoke_reason,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	DecidedAt    *time.Time     `json:"decided_at,omitempty"`
+}
 
 // Chunk describes one piece of an object. Digest is the content digest
 // (hex-encoded SHA-256 in this implementation) and acts as the blob key in the
@@ -212,10 +350,15 @@ type session struct {
 
 // replica tracks a target replica and the manifest version it currently serves.
 type replica struct {
-	ID              string    `json:"id"`
-	ObjectID        string    `json:"object_id"`
-	CurrentManifest string    `json:"current_manifest"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              string `json:"id"`
+	ObjectID        string `json:"object_id"`
+	CurrentManifest string `json:"current_manifest"`
+	// Usable is true only after an acceptance order approved the version the
+	// replica currently serves. A repaired-but-unaccepted replica must not
+	// be used as a new source.
+	Usable         bool      `json:"usable"`
+	UsableManifest string    `json:"usable_manifest,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // snapshot is the persisted on-disk format. Bumping snapshotFormat requires a
@@ -230,4 +373,5 @@ type snapshot struct {
 	Replicas      map[string]*replica               `json:"replicas"`
 	Blobs         map[string][]byte                 `json:"blobs"`
 	Notifications map[string]CompletionNotification `json:"notifications"`
+	Acceptances   map[string]*acceptance            `json:"acceptances,omitempty"`
 }

@@ -314,6 +314,10 @@ func (s *Service) completeLocked(sess *session, now time.Time) error {
 	// Atomic publish: the target only ever points at a fully verified
 	// manifest version.
 	rep.CurrentManifest = manifestKey(sess.SourceID, m.Version)
+	// A freshly repaired version is not usable as a new source until an
+	// acceptance order approves exactly this version.
+	rep.Usable = false
+	rep.UsableManifest = ""
 	rep.UpdatedAt = now
 
 	note := CompletionNotification{
